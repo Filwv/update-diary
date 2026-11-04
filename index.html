@@ -647,13 +647,12 @@ function makeEl(tag, cls){
 }
 
 /* =========================================================================
-   1. 本地持久化存储 (新增)
+   1. 本地持久化存储
    ========================================================================= */
 const STORAGE_KEY = 'cl_state_v1';
 
 function saveStateToLocal() {
   try {
-    // 剔除不需要保存的大对象，或者直接保存整个
     const dataToSave = {
       books: state.books,
       currentBookId: state.currentBookId,
@@ -1616,12 +1615,14 @@ PALETTES.forEach(p => {
   paletteList.appendChild(item);
 });
 
+/* ---- 背景图片持久化及压缩逻辑 ---- */
 const bgLayer = document.getElementById('bgLayer');
 const bgInput = document.getElementById('bgInput');
 const bgOpacitySlider = document.getElementById('bgOpacity');
 const bgFillSlider = document.getElementById('bgFill');
 const bgOpacityVal = document.getElementById('bgOpacityVal');
 const bgFillVal = document.getElementById('bgFillVal');
+const bgDropLabel = document.getElementById('bgDropLabel');
 
 function applyBackground(){
   if (state.bgImage) bgLayer.style.backgroundImage = `url("${state.bgImage}")`;
@@ -1642,11 +1643,42 @@ function applyBackground(){
 bgInput.addEventListener('change', e => {
   const f = e.target.files && e.target.files[0];
   if (!f) return;
+
   const reader = new FileReader();
   reader.onload = ev => {
-    state.bgImage = ev.target.result;
-    document.getElementById('bgDropLabel').textContent = '♡ ' + truncate(f.name, 20);
-    applyBackground();
+    // 使用 Canvas 压缩图片，防止 localStorage 爆满
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      let width = img.width;
+      let height = img.height;
+      const MAX_WIDTH = 1200; // 限制最大宽度 1200px
+
+      if (width > MAX_WIDTH) {
+        height = Math.round((height * MAX_WIDTH) / width);
+        width = MAX_WIDTH;
+      }
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+      
+      // 压缩为 jpeg，质量 0.8，极大减小体积
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+      
+      state.bgImage = dataUrl;
+      bgDropLabel.textContent = '♡ ' + truncate(f.name, 20);
+      applyBackground();
+
+      // 尝试保存到本地
+      try {
+        localStorage.setItem('cl_bgImage', state.bgImage);
+      } catch (err) {
+        alert('图片过大，浏览器存储空间不足，可能无法在下次打开时保留背景图。建议换一张小一点的图片哦～');
+        console.warn('背景图保存失败', err);
+      }
+    };
+    img.src = ev.target.result;
   };
   reader.readAsDataURL(f);
   e.target.value = '';
@@ -1654,8 +1686,9 @@ bgInput.addEventListener('change', e => {
 
 document.getElementById('clearBg').addEventListener('click', () => {
   state.bgImage = null;
-  document.getElementById('bgDropLabel').textContent = '♡ 点击选择背景图片';
+  bgDropLabel.textContent = '♡ 点击选择背景图片';
   applyBackground();
+  localStorage.removeItem('cl_bgImage');
 });
 
 bgOpacitySlider.addEventListener('input', applyBackground);
@@ -1674,6 +1707,16 @@ document.getElementById('resetBtn').addEventListener('click', () => {
   // 1. 读取本地的记录
   loadStateFromLocal();
 
+  // 2. 读取背景图
+  try {
+    const savedBg = localStorage.getItem('cl_bgImage');
+    if (savedBg) {
+      state.bgImage = savedBg;
+      bgDropLabel.textContent = '♡ 已保存的背景图';
+    }
+  } catch(e) {}
+
+  // 3. 读取配色和滑块设置
   let savedPalette = null;
   try{
     savedPalette = localStorage.getItem('cl_palette');
