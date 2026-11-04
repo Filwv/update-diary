@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>更新手帐 · Collage Changelog</title>
 
-<!-- PWA 配置：添加到主屏幕的图标与全屏体验 -->
+<!-- PWA 配置 -->
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="icon-192.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -17,7 +17,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Gaegu:wght@300;400;700&family=Quicksand:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-/* ============ 调色板（默认：奶盖桃气） ============ */
+/* ============ 调色板 ============ */
 :root{
   --bg:#fffbf3;
   --soft:#fff8d2;
@@ -354,7 +354,12 @@ body{
 
 /* 手动记录 */
 .manual-item{ display:flex; align-items:flex-start; gap:8px; flex-wrap:wrap; }
-.manual-text{ flex:1 1 auto; min-width:0; }
+.manual-text{ 
+  flex:1 1 auto; 
+  min-width:0; 
+  white-space: pre-wrap; /* 核心修复：保留换行和空格 */
+  word-break: break-word;
+}
 .manual-ops{
   display:inline-flex; gap:6px; opacity:.55;
   transition:opacity .2s; flex:none; align-items:center;
@@ -880,11 +885,17 @@ function analyzeHTML(html){
   const styles = doc.querySelectorAll('style');
   for (let i = 0; i < styles.length; i++) css += styles[i].textContent + '\n';
 
+  let js = '';
+  const scripts = doc.querySelectorAll('script');
+  for (let i = 0; i < scripts.length; i++) {
+    if (!scripts[i].src) js += scripts[i].textContent + '\n';
+  }
+
   const title = doc.title || '';
   const bodyText = doc.body ? doc.body.textContent : '';
   const textLen = normalizeText(bodyText).replace(/\s/g, '').length;
 
-  return { elements, css, title, textLen, size: html.length };
+  return { elements, css, js, title, textLen, size: html.length };
 }
 
 function splitCSSRules(css){
@@ -923,7 +934,7 @@ function diffAnalysis(prev, next){
   const usedB = new Uint8Array(B.length);
   for (const [i, j] of pairs){ usedA[i] = 1; usedB[j] = 1; }
 
-  const result = { meta:[], text:[], added:[], removed:[], attr:[], style:[] };
+  const result = { meta:[], text:[], added:[], removed:[], attr:[], style:[], script:[] };
 
   if (prev.title !== next.title){
     result.meta.push({ kind:'title', from: prev.title, to: next.title });
@@ -939,7 +950,7 @@ function diffAnalysis(prev, next){
 
     const keys = new Set([...Object.keys(a.attrs), ...Object.keys(b.attrs)]);
     for (const k of keys){
-      if (['id', 'class', 'style', 'data-v-', 'data-reactid'].some(prefix => k.startsWith(prefix))) continue;
+      if (['id', 'data-v-', 'data-reactid'].some(prefix => k.startsWith(prefix))) continue;
       const av = a.attrs[k], bv = b.attrs[k];
       if (av === bv) continue;
       if ((av === undefined || av === '') && (bv === undefined || bv === '')) continue;
@@ -979,6 +990,10 @@ function diffAnalysis(prev, next){
     result.style.push({ addedRules, removedRules });
   }
 
+  if (prev.js !== next.js) {
+    result.script.push({});
+  }
+
   return result;
 }
 
@@ -993,7 +1008,8 @@ const GROUPS = [
   { key:'added',   icon:'✚', title:'新增内容' },
   { key:'removed', icon:'✖', title:'移除内容' },
   { key:'attr',    icon:'⚙', title:'细节调整' },
-  { key:'style',   icon:'✦', title:'视觉样式' }
+  { key:'style',   icon:'✦', title:'视觉样式' },
+  { key:'script',  icon:'⚡', title:'交互逻辑' }
 ];
 
 function buildItems(groupKey, list){
@@ -1047,13 +1063,21 @@ function buildItems(groupKey, list){
       src: '资源/图片/链接', href: '跳转链接', alt: '图片说明', 
       title: '提示文字', placeholder: '输入提示', value: '默认内容'
     };
+    let hasLayoutChange = false;
     list.forEach(x => {
+      if (x.attr === 'class' || x.attr === 'style') {
+        hasLayoutChange = true;
+        return;
+      }
       const label = attrMap[x.attr];
       if (!label) return;
       if (!x.from) push(`新增了${label}：<span class="quote">${esc(truncate(x.to, 20))}</span>`);
       else if (!x.to) push(`移除了${label}`);
       else push(`${label}由 <span class="quote">${esc(truncate(x.from, 15))}</span> 改成了 <span class="quote">${esc(truncate(x.to, 15))}</span>`);
     });
+    if (hasLayoutChange) {
+      push(`元素的排版、颜色或内联样式有微调`);
+    }
     return { items, overflow, mark:'⚙' };
   }
 
@@ -1087,14 +1111,23 @@ function buildItems(groupKey, list){
     return { items, overflow, mark:'✦' };
   }
 
+  if (groupKey === 'script'){
+    if (list.length) {
+      push(`页面的交互逻辑或脚本代码有调整`);
+    }
+    return { items, overflow, mark:'⚡' };
+  }
+
   return { items, overflow, mark:'•' };
 }
 
 function createLogCard(group, list){
+  const { items, overflow, mark } = buildItems(group.key, list);
+  
+  if (items.length === 0) return null;
+
   const card = makeEl('article', 'log-card');
   card.style.setProperty('--rot', ((Math.random() * 2 - 1) * 0.9).toFixed(2) + 'deg');
-
-  const { items, overflow, mark } = buildItems(group.key, list);
 
   const head = makeEl('div', 'log-head');
   head.innerHTML =
@@ -1146,9 +1179,11 @@ function renderManualList(ul, version){
 
   version.manual.forEach(item => {
     const li = makeEl('li', 'manual-item');
+    // 核心修复：把换行符替换为 <br>，确保即使没有 CSS 也能正确换行
+    const displayText = esc(item.text).replace(/\n/g, '<br>');
     li.innerHTML =
       `<span class="mark">✐</span>` +
-      `<span class="manual-text">${esc(item.text)}</span>` +
+      `<span class="manual-text">${displayText}</span>` +
       `<span class="manual-ops">` +
         `<button class="op-btn" data-act="edit">编辑</button>` +
         `<button class="op-btn" data-act="del">删除</button>` +
@@ -1207,7 +1242,8 @@ function enterEdit(li, version, item){
   const ul = li.closest('.change-list');
 
   const doSave = () => {
-    const t = normalizeText(ta.value);
+    // 核心修复：这里不能用 normalizeText，否则换行会被吃掉，直接用 trim 即可
+    const t = ta.value.trim();
     if (!t){ alert('内容不能为空哦～'); ta.focus(); return; }
     item.text = t;
     saveStateToLocal(); // 保存
@@ -1266,7 +1302,7 @@ function createManualAdder(version){
   const form = makeEl('div', 'manual-form');
   form.style.display = 'none';
   form.innerHTML =
-    `<textarea class="manual-input" placeholder="写下这一版你想补充的更新说明…（比如：优化了首页排版）"></textarea>` +
+    `<textarea class="manual-input" placeholder="写下这一版你想补充的更新说明…（支持换行）"></textarea>` +
     `<div class="manual-form-ops">` +
       `<button class="op-btn primary" data-act="save">保存</button>` +
       `<button class="op-btn" data-act="cancel">取消</button>` +
@@ -1292,7 +1328,8 @@ function createManualAdder(version){
   form.querySelector('[data-act="cancel"]').addEventListener('click', closeForm);
 
   form.querySelector('[data-act="save"]').addEventListener('click', () => {
-    const t = normalizeText(ta.value);
+    // 核心修复：这里同样不能用 normalizeText，保留换行符
+    const t = ta.value.trim();
     if (!t){ alert('写点什么再保存吧～'); ta.focus(); return; }
 
     version.manual.push({ id: Date.now() + Math.random(), text: t });
@@ -1476,15 +1513,19 @@ function buildVersionBlock(i, book){
     GROUPS.forEach(g => {
       const list = changes[g.key];
       if (!list || !list.length) return;
-      total += list.length;
-      cards.appendChild(createLogCard(g, list));
+      
+      const cardEl = createLogCard(g, list);
+      if (cardEl) {
+        total += list.length;
+        cards.appendChild(cardEl);
+      }
     });
 
     if (total === 0){
       const card = makeEl('div', 'baseline-card');
       card.innerHTML =
         `<strong>这一版没有检测到任何变化 ✿</strong><br>` +
-        `页面内容与上一份文件完全一致哦～`;
+        `页面结构、文字、样式与脚本与上一份文件完全一致哦～`;
       block.appendChild(card);
     } else {
       const keysWithChanges = Object.keys(changes).filter(k => changes[k].length > 0);
