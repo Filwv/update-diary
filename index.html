@@ -357,7 +357,7 @@ body{
 .manual-text{ 
   flex:1 1 auto; 
   min-width:0; 
-  white-space: pre-wrap; /* 核心修复：保留换行和空格 */
+  white-space: pre-wrap; /* 保留换行和空格 */
   word-break: break-word;
 }
 .manual-ops{
@@ -650,13 +650,71 @@ function makeEl(tag, cls){
   if (cls) e.className = cls;
   return e;
 }
+function simpleHash(str) {
+  let hash = 0;
+  if (!str) return hash;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return hash;
+}
 
 /* =========================================================================
-   1. 本地持久化存储
+   1. IndexedDB 本地持久化存储
    ========================================================================= */
-const STORAGE_KEY = 'cl_state_v1';
+const DB_NAME = 'UpdateDiaryDB';
+const STORE_NAME = 'kv_store';
+let db = null;
 
-function saveStateToLocal() {
+function initDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = e => {
+      const d = e.target.result;
+      if (!d.objectStoreNames.contains(STORE_NAME)) {
+        d.createObjectStore(STORE_NAME);
+      }
+    };
+    req.onsuccess = e => { db = e.target.result; resolve(db); };
+    req.onerror = e => { reject(e.target.error); };
+  });
+}
+
+function idbSet(key, val) {
+  return new Promise((resolve, reject) => {
+    if (!db) return reject('DB not initialized');
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    const req = store.put(val, key);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function idbGet(key) {
+  return new Promise((resolve, reject) => {
+    if (!db) return reject('DB not initialized');
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const store = tx.objectStore(STORE_NAME);
+    const req = store.get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function idbRemove(key) {
+  return new Promise((resolve, reject) => {
+    if (!db) return reject('DB not initialized');
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    const req = store.delete(key);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveStateToLocal() {
   try {
     const dataToSave = {
       books: state.books,
@@ -664,26 +722,36 @@ function saveStateToLocal() {
       nextBookId: state.nextBookId,
       nextVersionId: state.nextVersionId
     };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(dataToSave));
+    await idbSet('cl_state', dataToSave);
   } catch(e) {
-    console.warn('保存失败，可能存储超限了', e);
+    console.error('保存失败:', e);
+    alert('😭 存储失败！可能是设备存储空间不足。请尝试删除一些不需要的历史记录。');
   }
 }
 
-function loadStateFromLocal() {
+async function loadStateFromLocal() {
   try {
-    const data = localStorage.getItem(STORAGE_KEY);
-    if (data) {
-      const parsed = JSON.parse(data);
-      if (parsed.books && parsed.books.length > 0) {
-        state.books = parsed.books;
-        state.currentBookId = parsed.currentBookId || parsed.books[0].id;
-        state.nextBookId = parsed.nextBookId || 2;
-        state.nextVersionId = parsed.nextVersionId || 1;
+    let data = await idbGet('cl_state');
+    
+    // 如果 IDB 里没有，尝试从旧的 localStorage 迁移
+    if (!data) {
+      const oldData = localStorage.getItem('cl_state_v1');
+      if (oldData) {
+        data = JSON.parse(oldData);
+        await idbSet('cl_state', data);
+        localStorage.removeItem('cl_state_v1');
+        console.log('已成功迁移旧数据到 IndexedDB');
       }
     }
+
+    if (data && data.books && data.books.length > 0) {
+      state.books = data.books;
+      state.currentBookId = data.currentBookId || data.books[0].id;
+      state.nextBookId = data.nextBookId || 2;
+      state.nextVersionId = data.nextVersionId || 1;
+    }
   } catch(e) {
-    console.warn('读取本地记录失败', e);
+    console.error('读取本地记录失败', e);
   }
 }
 
@@ -724,7 +792,7 @@ function applyPalette(id){
 }
 
 /* =========================================================================
-   3. 元素采集 & Diff 引擎
+   3. 元素采集 & Diff 引擎（轻量化，彻底抛弃无用属性）
    ========================================================================= */
 const SKIP_TAGS = new Set(['SCRIPT','STYLE','NOSCRIPT','LINK','META','TITLE','BASE','HEAD','HTML','BODY']);
 
@@ -748,12 +816,13 @@ function collectElements(doc){
   const body = doc.body;
   if (!body) return out;
 
-  const walk = (el, depth, ancestors, heading) => {
+  const walk = (el, depth, heading) => {
     if (!el.tagName || SKIP_TAGS.has(el.tagName)) return;
 
     let cls = '';
     if (typeof el.className === 'string') cls = el.className;
     else if (el.className && typeof el.className.baseVal === 'string') cls = el.className.baseVal;
+    cls = cls.slice(0, 100);
 
     let directText = '';
     const kids = el.childNodes;
@@ -768,14 +837,15 @@ function collectElements(doc){
       }
       directText = parts.join(' ');
     }
-
-    let innerText = el.innerText || el.textContent || '';
-    innerText = normalizeText(innerText);
+    directText = directText.slice(0, 200);
 
     const attrs = {};
     if (el.attributes){
       for (let i = 0; i < el.attributes.length; i++){
         const a = el.attributes[i];
+        if (['class', 'style', 'id'].includes(a.name)) continue;
+        if (a.name.startsWith('data-') && a.name !== 'data-src') continue;
+        if (a.value.length > 200) continue;
         attrs[a.name] = a.value;
       }
     }
@@ -796,24 +866,20 @@ function collectElements(doc){
 
     out.push({
       tag, id: el.getAttribute('id') || '', cls, attrs,
-      text: directText, innerText: innerText, depth,
-      path: ancestors.slice(),
-      siblingIndex,
-      heading: heading || ''
+      text: directText, depth, siblingIndex, heading: heading || ''
     });
 
     const isHeading = /^h[1-6]$/.test(tag);
     const nextHeading = isHeading ? (directText || heading) : heading;
-    const nextAnc = ancestors.length >= 8 ? ancestors : ancestors.concat([tag]);
 
     const children = el.children;
     for (let i = 0; i < children.length; i++){
-      walk(children[i], depth + 1, nextAnc, nextHeading);
+      walk(children[i], depth + 1, nextHeading);
     }
   };
 
   for (let i = 0; i < body.children.length; i++){
-    walk(body.children[i], 0, [], '');
+    walk(body.children[i], 0, '');
   }
   return out;
 }
@@ -821,7 +887,6 @@ function collectElements(doc){
 function getFriendlyDesc(el){
   let type = tagLabel(el.tag);
   let text = el.attrs.alt || el.attrs.placeholder || el.attrs.title || el.text;
-  if (!text && el.innerText) text = el.innerText;
   if (text) {
     text = normalizeText(text);
     if (text.length > 15) text = text.slice(0, 15) + '…';
@@ -891,16 +956,26 @@ function analyzeHTML(html){
     if (!scripts[i].src) js += scripts[i].textContent + '\n';
   }
 
+  const cssComments = [];
+  const regex = /\/\*\s*([^*]*[\u4e00-\u9fa5]+[^*]*)\*\//g;
+  let match;
+  while ((match = regex.exec(css)) !== null) {
+    const txt = normalizeText(match[1].replace(/👇|👇🏻|👇🏼|👇🏽|👇🏾|👇🏿/g, ''));
+    if (txt) cssComments.push(txt);
+  }
+
   const title = doc.title || '';
   const bodyText = doc.body ? doc.body.textContent : '';
   const textLen = normalizeText(bodyText).replace(/\s/g, '').length;
 
-  return { elements, css, js, title, textLen, size: html.length };
-}
-
-function splitCSSRules(css){
-  if (!css) return [];
-  return css.split('}').map(s => normalizeText(s)).filter(Boolean);
+  return { 
+    elements, 
+    cssHash: simpleHash(css), 
+    cssComments, 
+    jsHash: simpleHash(js), 
+    title, 
+    textLen
+  };
 }
 
 function diffSnippet(a, b){
@@ -980,17 +1055,19 @@ function diffAnalysis(prev, next){
     }
   }
 
-  const ra = splitCSSRules(prev.css);
-  const rb = splitCSSRules(next.css);
-  const setA = new Set(ra), setB = new Set(rb);
-  const addedRules = [], removedRules = [];
-  for (const r of rb) if (!setA.has(r)) addedRules.push(r);
-  for (const r of ra) if (!setB.has(r)) removedRules.push(r);
-  if (addedRules.length || removedRules.length) {
-    result.style.push({ addedRules, removedRules });
+  if (prev.cssHash !== next.cssHash) {
+    const setA = new Set(prev.cssComments || []);
+    const setB = new Set(next.cssComments || []);
+    const addedComments = [];
+    const removedComments = [];
+    
+    (next.cssComments || []).forEach(c => { if (!setA.has(c)) addedComments.push(c); });
+    (prev.cssComments || []).forEach(c => { if (!setB.has(c)) removedComments.push(c); });
+    
+    result.style.push({ addedComments, removedComments });
   }
 
-  if (prev.js !== next.js) {
+  if (prev.jsHash !== next.jsHash) {
     result.script.push({});
   }
 
@@ -1082,30 +1159,15 @@ function buildItems(groupKey, list){
   }
 
   if (groupKey === 'style'){
-    const addedComments = new Set();
-    const removedComments = new Set();
-
     list.forEach(x => {
-      (x.addedRules || []).forEach(r => {
-        const match = r.match(/\/\*\s*([^*]*[\u4e00-\u9fa5]+[^*]*)\*\//);
-        if (match && match[1]) {
-          const txt = normalizeText(match[1].replace(/👇|👇🏻|👇🏼|👇🏽|👇🏾|👇🏿/g, ''));
-          if (txt) addedComments.add(txt);
-        }
-      });
-      (x.removedRules || []).forEach(r => {
-        const match = r.match(/\/\*\s*([^*]*[\u4e00-\u9fa5]+[^*]*)\*\//);
-        if (match && match[1]) {
-          const txt = normalizeText(match[1].replace(/👇|👇🏻|👇🏼|👇🏽|👇🏾|👇🏿/g, ''));
-          if (txt) removedComments.add(txt);
-        }
-      });
+      if (x.addedComments && x.addedComments.length) {
+        x.addedComments.forEach(c => push(`新增样式：<span class="quote">${esc(c)}</span>`));
+      }
+      if (x.removedComments && x.removedComments.length) {
+        x.removedComments.forEach(c => push(`删减样式：<span class="quote">${esc(c)}</span>`));
+      }
     });
-
-    if (addedComments.size) addedComments.forEach(c => push(`新增样式：<span class="quote">${esc(c)}</span>`));
-    if (removedComments.size) removedComments.forEach(c => push(`删减样式：<span class="quote">${esc(c)}</span>`));
-    
-    if (!addedComments.size && !removedComments.size) {
+    if (!items.length) {
       push(`页面的颜色、排版或动画效果有微调（底层样式代码有改动）`);
     }
     return { items, overflow, mark:'✦' };
@@ -1179,7 +1241,6 @@ function renderManualList(ul, version){
 
   version.manual.forEach(item => {
     const li = makeEl('li', 'manual-item');
-    // 核心修复：把换行符替换为 <br>，确保即使没有 CSS 也能正确换行
     const displayText = esc(item.text).replace(/\n/g, '<br>');
     li.innerHTML =
       `<span class="mark">✐</span>` +
@@ -1242,7 +1303,6 @@ function enterEdit(li, version, item){
   const ul = li.closest('.change-list');
 
   const doSave = () => {
-    // 核心修复：这里不能用 normalizeText，否则换行会被吃掉，直接用 trim 即可
     const t = ta.value.trim();
     if (!t){ alert('内容不能为空哦～'); ta.focus(); return; }
     item.text = t;
@@ -1328,7 +1388,6 @@ function createManualAdder(version){
   form.querySelector('[data-act="cancel"]').addEventListener('click', closeForm);
 
   form.querySelector('[data-act="save"]').addEventListener('click', () => {
-    // 核心修复：这里同样不能用 normalizeText，保留换行符
     const t = ta.value.trim();
     if (!t){ alert('写点什么再保存吧～'); ta.focus(); return; }
 
@@ -1593,7 +1652,7 @@ async function handleHTMLFile(file){
     manual: []
   });
 
-  saveStateToLocal(); // 保存
+  await saveStateToLocal(); // 确保存完再渲染
   renderAll(true);
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
@@ -1687,13 +1746,12 @@ bgInput.addEventListener('change', e => {
 
   const reader = new FileReader();
   reader.onload = ev => {
-    // 使用 Canvas 压缩图片，防止 localStorage 爆满
     const img = new Image();
     img.onload = () => {
       const canvas = document.createElement('canvas');
       let width = img.width;
       let height = img.height;
-      const MAX_WIDTH = 1200; // 限制最大宽度 1200px
+      const MAX_WIDTH = 1200;
 
       if (width > MAX_WIDTH) {
         height = Math.round((height * MAX_WIDTH) / width);
@@ -1704,20 +1762,16 @@ bgInput.addEventListener('change', e => {
       const ctx = canvas.getContext('2d');
       ctx.drawImage(img, 0, 0, width, height);
       
-      // 压缩为 jpeg，质量 0.8，极大减小体积
       const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
       
       state.bgImage = dataUrl;
       bgDropLabel.textContent = '♡ ' + truncate(f.name, 20);
       applyBackground();
 
-      // 尝试保存到本地
-      try {
-        localStorage.setItem('cl_bgImage', state.bgImage);
-      } catch (err) {
-        alert('图片过大，浏览器存储空间不足，可能无法在下次打开时保留背景图。建议换一张小一点的图片哦～');
+      // 存入 IndexedDB
+      idbSet('cl_bgImage', state.bgImage).catch(err => {
         console.warn('背景图保存失败', err);
-      }
+      });
     };
     img.src = ev.target.result;
   };
@@ -1729,7 +1783,7 @@ document.getElementById('clearBg').addEventListener('click', () => {
   state.bgImage = null;
   bgDropLabel.textContent = '♡ 点击选择背景图片';
   applyBackground();
-  localStorage.removeItem('cl_bgImage');
+  idbRemove('cl_bgImage').catch(()=>{});
 });
 
 bgOpacitySlider.addEventListener('input', applyBackground);
@@ -1744,13 +1798,21 @@ document.getElementById('resetBtn').addEventListener('click', () => {
   renderAll(false);
 });
 
-(function init(){
+(async function init(){
+  // 初始化 IDB
+  try {
+    await initDB();
+  } catch (e) {
+    alert('无法初始化本地数据库，浏览器可能不支持或处于无痕模式。数据将无法保存。');
+    console.error(e);
+  }
+
   // 1. 读取本地的记录
-  loadStateFromLocal();
+  await loadStateFromLocal();
 
   // 2. 读取背景图
   try {
-    const savedBg = localStorage.getItem('cl_bgImage');
+    const savedBg = await idbGet('cl_bgImage');
     if (savedBg) {
       state.bgImage = savedBg;
       bgDropLabel.textContent = '♡ 已保存的背景图';
